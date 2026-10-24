@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#07111f">
+<title>J.A.R.V.I.S.</title>
+<style>
+:root{color-scheme:dark;--bg:#07111f;--panel:#0b1929;--line:#24435c;--cyan:#64ddff;--text:#d9f5ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:16px -apple-system,BlinkMacSystemFont,sans-serif}
+main{max-width:760px;margin:auto;padding:20px}header{text-align:center;padding:18px 0}
+h1{letter-spacing:6px;color:var(--cyan);margin-bottom:8px}.status{color:#6fe8b2;font-size:13px}
+#chat{height:48vh;min-height:280px;overflow:auto;border:1px solid var(--line);border-radius:14px;padding:12px;background:var(--panel)}
+.message{padding:11px 13px;margin:10px 0;border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.45}
+.jarvis{background:#112c40}.user{background:#173a35;text-align:right}.system{background:#352b18;color:#ffe4a3}
+form{display:flex;gap:8px;margin-top:12px}input,button{font:inherit;padding:13px;border-radius:10px}
+input{min-width:0;flex:1;color:white;background:var(--panel);border:1px solid #35536b}
+button{border:0;color:#04111d;background:var(--cyan);font-weight:700;cursor:pointer}
+.tools{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}.tools button{background:#17364a;color:var(--text)}
+small{color:#a5bdcc}.note{font-size:12px;color:#a5bdcc;line-height:1.45}
+</style>
+</head>
+<body><main>
+<header><h1>J.A.R.V.I.S.</h1><p>JUST A RATHER VERY INTELLIGENT SYSTEM</p><p class="status">● AI LINK READY — V0.2</p></header>
+<section id="chat" aria-live="polite"></section>
+<form id="form"><input id="input" placeholder="Give me a command..." autocomplete="off" required><button id="send">Send</button></form>
+<div class="tools">
+<button type="button" id="notes">My notes</button><button type="button" id="help">Commands</button><button type="button" id="clear">Clear chat</button><button type="button" id="forgetAccess">Forget access password</button>
+</div>
+<p class="note">Early personal prototype. Chat and notes are stored in this browser. Do not enter confidential information. The access password is held in session storage only for this browser tab session.</p>
+</main>
+<script>
+"use strict";
+const WORKER_URL = "PASTE_YOUR_CLOUDFLARE_WORKER_URL_HERE";
+const chat = document.querySelector("#chat");
+const input = document.querySelector("#input");
+const sendButton = document.querySelector("#send");
+let history = readStore("jarvis-chat", []);
+let notes = readStore("jarvis-notes", []);
+
+function readStore(key, fallback) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "null");
+    return value === null ? fallback : value;
+  } catch { return fallback; }
+}
+function save() {
+  try {
+    localStorage.setItem("jarvis-chat", JSON.stringify(history.slice(-60)));
+    localStorage.setItem("jarvis-notes", JSON.stringify(notes));
+  } catch {
+    render("system", "Browser storage is unavailable or full. Your current message may not be saved.", false);
+  }
+}
+function render(who, text, remember=true) {
+  const bubble = document.createElement("div");
+  bubble.className = "message " + who;
+  bubble.textContent = String(text);
+  chat.appendChild(bubble);
+  chat.scrollTop = chat.scrollHeight;
+  if (remember) {
+    history.push({who, text:String(text)});
+    history = history.slice(-60);
+    save();
+  }
+  return bubble;
+}
+function localReply(command) {
+  const text = command.trim(), c = text.toLowerCase();
+  if (c === "help" || c === "commands") return "Commands:\nhelp — show commands\ntime — current time\ndate — today's date\nremember: something — save a note\nnotes — read saved notes\nforget notes — delete saved notes\nAny other message is sent to the AI.";
+  if (c === "time") return "The time is " + new Date().toLocaleTimeString();
+  if (c === "date") return "Today is " + new Date().toLocaleDateString();
+  if (c.startsWith("remember:")) {
+    const note = text.slice(9).trim();
+    if (!note) return "Tell me what you want me to remember.";
+    notes.push(note); save();
+    return "Saved that note in this browser.";
+  }
+  if (c === "notes") return notes.length ? notes.map((n,i)=>`${i+1}. ${n}`).join("\n") : "Your notebook is empty. Try: remember: buy milk";
+  if (c === "forget notes") { notes=[]; save(); return "Your saved notes have been deleted."; }
+  return null;
+}
+async function askAI() {
+  if (!WORKER_URL.startsWith("https://") || WORKER_URL.includes("PASTE_YOUR")) {
+    render("jarvis", "Setup needed: add your Cloudflare Worker URL to index.html first.");
+    return;
+  }
+  let password = sessionStorage.getItem("jarvis-access");
+  if (!password) {
+    password = prompt("Enter your private JARVIS access password:");
+    if (!password) { render("jarvis", "Access password required."); return; }
+    sessionStorage.setItem("jarvis-access", password);
+  }
+  const messages = history
+    .filter(m => m.who === "user" || m.who === "jarvis")
+    .slice(-12)
+    .map(m => ({role: m.who === "user" ? "user" : "model", text: m.text}));
+  // Ensure the provider receives the latest user message as the final item.
+  if (!messages.length || messages[messages.length-1].role !== "user") {
+    render("system", "Could not prepare conversation history. Please try again.", false);
+    return;
+  }
+  const waiting = render("jarvis", "Thinking…", false);
+  sendButton.disabled = true;
+  try {
+    const response = await fetch(WORKER_URL, {
+      method:"POST",
+      headers:{"Content-Type":"application/json","Authorization":"Bearer "+password},
+      body:JSON.stringify({messages})
+    });
+    const data = await response.json().catch(()=>({}));
+    waiting.remove();
+    if (response.status === 401) {
+      sessionStorage.removeItem("jarvis-access");
+      render("jarvis", "Access denied. Check your password and try again.");
+    } else if (!response.ok) {
+      render("jarvis", data.error || `AI request failed (${response.status}).`);
+    } else if (typeof data.answer === "string") {
+      render("jarvis", data.answer);
+    } else {
+      render("jarvis", "The AI returned an unexpected response.");
+    }
+  } catch {
+    waiting.remove();
+    render("jarvis", "I couldn't reach my AI brain. Check the Worker URL and your connection.");
+  } finally { sendButton.disabled = false; input.focus(); }
+}
+document.querySelector("#form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const text = input.value.trim();
+  if (!text || sendButton.disabled) return;
+  input.value = "";
+  render("user", text);
+  const local = localReply(text);
+  if (local !== null) { render("jarvis", local); return; }
+  await askAI();
+});
+document.querySelector("#notes").onclick = () => render("jarvis", localReply("notes"), false);
+document.querySelector("#help").onclick = () => render("jarvis", localReply("help"), false);
+document.querySelector("#clear").onclick = () => {
+  history=[]; save(); chat.replaceChildren();
+  render("jarvis", "Chat cleared. Your saved notes remain.");
+};
+document.querySelector("#forgetAccess").onclick = () => {
+  sessionStorage.removeItem("jarvis-access");
+  render("jarvis", "Access password cleared from this tab's session storage.");
+};
+history.forEach(m => {
+  if (m && ["user","jarvis","system"].includes(m.who)) render(m.who, m.text, false);
+});
+if (!history.length) render("jarvis", "Good day. J.A.R.V.I.S. AI interface is ready. Type 'help' for local commands.", true);
+</script></body></html>
